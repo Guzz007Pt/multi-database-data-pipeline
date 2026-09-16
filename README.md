@@ -1,328 +1,256 @@
-# Estágio — Pipeline Meteorologia (v0.4)
+# Extensible Data Pipeline
 
-Pipeline para:
-- recolher dados meteorológicos via **REST API** (provider selecionado por `.env`)
-- normalizar para um **registo canónico (core)**
-- **deduplicar por timestamp** antes de inserir
-- persistir em **várias bases de dados** (Postgres/MySQL/CrateDB/MongoDB)
-- enviar **email de resumo** (Resend ou SMTP)
+An extensible data ingestion pipeline for collecting data from multiple external APIs, normalizing it into a canonical representation, deduplicating records, and persisting them across different database systems.
 
----
+The project was initially developed for **meteorological data**, but its architecture was designed so that new data providers, database targets, and fields can be added without changing the core pipeline logic.
 
-## Índice
+## Key Features
 
-- [Arquitetura](#arquitetura)
-- [Requisitos](#requisitos)
-- [Instalação](#instalação)
-- [Configuração](#configuração)
-  - [Variáveis de ambiente](#variáveis-de-ambiente)
-  - [Ficheiro `db_targets.json`](#ficheiro-db_targetsjson)
-- [Como executar](#como-executar)
-- [Deduplicação](#deduplicação)
-- [Schema mínimo recomendado](#schema-mínimo-recomendado)
-- [Mapeamento de dados](#mapeamento-de-dados)
-- [Extensibilidade](#extensibilidade)
-  - [Adicionar uma nova BD (target)](#adicionar-uma-nova-bd-target)
-  - [Adicionar uma nova API (provider)](#adicionar-uma-nova-api-provider)
-  - [Adicionar colunas novas](#adicionar-colunas-novas)
-    - [Novo campo **extra** (opcional)](#novo-campo-extra-opcional)
-    - [Novo campo **core** (obrigatório)](#novo-campo-core-obrigatório)
-- [Troubleshooting](#troubleshooting)
+* Multiple external **REST API providers**
+* Canonical data representation independent of the source API
+* Timestamp normalization
+* Record deduplication before insertion
+* Multiple database backends
+* Configurable providers and targets through environment/configuration files
+* Optional additional fields without modifying the core schema
+* Execution summary reports via email
+* Extensible provider and storage architecture
 
----
-
-## Arquitetura
+## Architecture
 
 ```mermaid
 flowchart TD
-  A["Config<br/>.env + db_targets.json"] --> B["Request API<br/>provider selecionado"]
-  B --> C["Parse<br/>registo canónico (core)"]
-  C --> D["Normalize timestamps<br/>UTC, sem microseconds"]
-  D --> E["Load + connect targets"]
-  E --> F["Batching<br/>(fonte, timestamp)"]
-  F --> G["Dedup<br/>(fonte, data, lugar) por target"]
-  G --> H["Insert<br/>core + regdata + extras opcional"]
-  H --> I["Relatório PCP-like + Email"]
+    A["Configuration<br/>.env + db_targets.json"] --> B["Request API<br/>Selected provider"]
+    B --> C["Parse response<br/>Canonical representation"]
+    C --> D["Normalize data<br/>Timestamps / fields"]
+    D --> E["Load database targets"]
+    E --> F["Batch records"]
+    F --> G["Deduplicate<br/>source + timestamp + location"]
+    G --> H["Persist records<br/>core + extras"]
+    H --> I["Generate report<br/>Email"]
 ```
 
----
+The pipeline separates the **data source** from the **storage target**.
 
-## Requisitos
+A provider is responsible for converting its API response into the common canonical format, while database targets consume that same representation independently.
 
-- Python 3.10+
-- Dependências (conforme targets que são usados):
-  - `requests`
-  - `python-dotenv` (opcional)
-  - `psycopg2-binary` (Postgres / CrateDB via wire protocol)
-  - `pymysql` ou `mysql-connector-python` (MySQL/MariaDB/TiDB)
-  - `pymongo` (MongoDB)
-  - `tabulate` (opcional, para HTML/texto do relatório)
+This means that adding a new API does not require changing the persistence layer, and adding a new database does not require changing individual providers.
 
----
+## Supported Providers
 
-## Instalação
+The current implementation includes support for meteorological data from:
 
-```bash
-pip install -r requirements.txt
-# ou manual:
-pip install requests python-dotenv psycopg2-binary pymysql mysql-connector-python pymongo tabulate
+* **Weatherbit**
+* **IPMA**
+* **ICAO / METAR**
+
+Each provider converts its own response format into the same internal representation.
+
+Example:
+
+```python
+{
+    "fonte": "...",
+    "data": datetime(...),
+    "temp": 20.5,
+    "humidade": 75,
+    "vento": 4.2,
+    "pressao": 1015,
+    "precipitacao": 0.0,
+    "lugar": "...",
+    "lat": 41.15,
+    "lon": -8.61,
+    "extras": {}
+}
 ```
 
----
+Provider-specific data that does not belong to the common schema can be stored inside `extras`.
 
-## Configuração
+## Supported Database Targets
 
-### Variáveis de ambiente
+The pipeline currently supports:
 
-Recomendação para GitHub:
-- criar um `.env` local (não commit)
-- dar commit a um `.env.example` com placeholders
+* PostgreSQL-compatible databases
+* MySQL / MariaDB
+* CrateDB
+* MongoDB
 
-Exemplo (mínimo funcional):
+Targets are configured independently through `db_targets.json`.
 
-```env
-PIPELINE_NAME=GM-METEO
-PIPELINE_ENV=local
-PIPELINE_USER=gustavo
-
-# provider: weatherbit | ipma | icao
-PIPELINE_API_PROVIDER=icao
-
-# só se provider=icao
-ICAO_CODE=LPPR
-
-# targets
-PIPELINE_DB_TARGETS_FILE=db_targets.json
-
-# extras (opcional): nome da coluna SQL para JSON/texto com extras
-# deixar vazio se não quer extras por default em SQL
-PIPELINE_SQL_EXTRAS_COLUMN=extras
-
-# email (opcional)
-PIPELINE_EMAIL_FROM=estagio.pipeline@example.com
-PIPELINE_EMAIL_TO=you@example.com
-```
-
-**Notas:**
-- `PIPELINE_API_PROVIDER` **não tem fallback**: se falhar, a execução falha.
-- Se for definido `PIPELINE_API_URL`, ele faz override ao URL automático do provider (útil para testes).
-
----
-
-### Ficheiro `db_targets.json`
-
-O ficheiro indica **para onde escrever**. Cada target tem:
-- `name`: nome 
-- `type`: `postgres` | `mysql` | `cratedb` | `mongodb`
-- `dsn_env` / `uri_env`: nome da variável de ambiente com a credencial
-- `table` ou `database/collection`
-- `extras_column` (opcional): override por target (ex.: só alguns SQL aceitam extras)
-
-Exemplo:
+Example:
 
 ```json
 {
   "targets": [
-    { "name": "cockroach", "type": "postgres", "dsn_env": "COCKROACH_DSN", "table": "meteo", "extras_column": "extras" },
-    { "name": "mariadb",   "type": "mysql",    "dsn_env": "MARIADB_DSN",   "table": "meteo", "extras_column": "" },
-    { "name": "mongodb",   "type": "mongodb",  "uri_env": "MONGO_URI",     "database": "meteo", "collection": "meteo" }
+    {
+      "name": "postgres",
+      "type": "postgres",
+      "dsn_env": "POSTGRES_DSN",
+      "table": "meteo",
+      "extras_column": "extras"
+    },
+    {
+      "name": "mongodb",
+      "type": "mongodb",
+      "uri_env": "MONGO_URI",
+      "database": "meteo",
+      "collection": "meteo"
+    }
   ]
 }
 ```
 
-**Regra simples para extras em SQL:**
-- Se `extras_column` **for string vazia** → esse target **não recebe** extras.
-- Se `extras_column` não existir → usar o default `PIPELINE_SQL_EXTRAS_COLUMN`.
+Database credentials are referenced through environment variables rather than stored in the configuration file.
 
----
+## Deduplication
 
-## Como executar
+The pipeline is designed to be safely re-executed without continuously inserting the same observations.
+
+Records are identified using:
+
+```text
+(source, timestamp, location)
+```
+
+For every target, the pipeline:
+
+1. groups incoming observations;
+2. checks which locations already exist for the corresponding source and timestamp;
+3. inserts only records that are not already present.
+
+For additional protection against concurrent writes, SQL targets can define a unique constraint:
+
+```sql
+UNIQUE (fonte, data, lugar)
+```
+
+MongoDB can use an equivalent unique compound index:
+
+```javascript
+db.meteo.createIndex(
+    { fonte: 1, data: 1, lugar: 1 },
+    { unique: true }
+)
+```
+
+## Extensibility
+
+A major goal of the project was to avoid coupling the pipeline to a single API or database technology.
+
+### Adding a New Data Provider
+
+A provider only needs to:
+
+1. request or receive data from the new source;
+2. parse the provider-specific format;
+3. return records using the canonical representation.
+
+For example:
+
+```python
+rows.append({
+    "fonte": source,
+    "data": timestamp,
+    "lugar": location,
+    # canonical fields...
+    "extras": {}
+})
+```
+
+The deduplication and persistence layers can then process those records without knowing which API produced them.
+
+### Adding a New Database Target
+
+A new storage target implements the expected database operations while keeping the rest of the pipeline unchanged.
+
+Configuration determines which targets are active:
+
+```text
+API Provider
+     │
+     ▼
+Canonical Records
+     │
+     ├── PostgreSQL
+     ├── MySQL
+     ├── CrateDB
+     └── MongoDB
+```
+
+### Adding New Fields
+
+Fields common to every provider can become part of the canonical representation.
+
+Provider-specific fields are instead stored inside:
+
+```python
+extras
+```
+
+This avoids changing every database schema whenever one provider exposes additional information.
+
+## Configuration
+
+Configuration is handled using environment variables and `db_targets.json`.
+
+Example `.env`:
+
+```env
+PIPELINE_NAME=GM-METEO
+PIPELINE_ENV=local
+
+PIPELINE_API_PROVIDER=icao
+
+ICAO_CODE=LPPR
+
+PIPELINE_DB_TARGETS_FILE=db_targets.json
+
+PIPELINE_SQL_EXTRAS_COLUMN=extras
+```
+
+Sensitive values such as API keys and database credentials should remain in the local `.env` file.
+
+An `.env.example` can be committed with placeholder values.
+
+## Installation
+
+Requires **Python 3.10+**.
+
+Install dependencies with:
+
+```bash
+pip install -r requirements.txt
+```
+
+Main dependencies include:
+
+* `requests`
+* `python-dotenv`
+* `psycopg2-binary`
+* `pymysql`
+* `mysql-connector-python`
+* `pymongo`
+* `tabulate`
+
+The exact database dependencies required depend on the configured targets.
+
+## Running
 
 ```bash
 python main.py
 ```
 
----
+The selected provider and database targets are loaded from the project configuration.
 
-## Deduplicação
+## Project Goals
 
-A pipeline faz dedup **apenas por timestamp**, com esta lógica:
+This project explores several software engineering problems beyond simply retrieving weather data:
 
-1. agrupa linhas por **(fonte, data)**  
-2. para cada target:
-   - busca os `lugar` já existentes para `(fonte, data)`
-   - insere apenas os `lugar` novos
+* isolating external API formats from application logic;
+* designing a common representation for heterogeneous sources;
+* supporting multiple storage technologies;
+* preventing duplicate ingestion;
+* managing configuration and credentials;
+* designing systems that can be extended without rewriting existing components.
 
-Isto torna a execução **idempotente** (re-executar não duplica), desde que:
-- o timestamp normalizado seja consistente (UTC, sem microseconds)
-- o `lugar` seja estável (ex.: estação / cidade / ICAO)
-
-> Dica: para segurança contra concorrência, criar um índice/constraint UNIQUE em `(fonte, data, lugar)`.
-
----
-
-## Schema mínimo recomendado (meteorologia)
-
-### Core (comum a todos)
-
-Campos usados no **core**:
-
-- `fonte` (texto)
-- `data` (timestamp)
-- `temp` (float)
-- `humidade` (float)
-- `vento` (float)
-- `pressao` (float)
-- `precipitacao` (float)
-- `lugar` (texto)
-- `lat` (float)
-- `lon` (float)
-- `regdata` (timestamp de inserção)
-
-### SQL (Postgres) 
-
-```sql
-CREATE TABLE meteo (
-  fonte TEXT NOT NULL,
-  data  TIMESTAMP NOT NULL,
-  temp  DOUBLE PRECISION NULL,
-  humidade DOUBLE PRECISION NULL,
-  vento DOUBLE PRECISION NULL,
-  pressao DOUBLE PRECISION NULL,
-  precipitacao DOUBLE PRECISION NULL,
-  lugar TEXT NOT NULL,
-  lat DOUBLE PRECISION NULL,
-  lon DOUBLE PRECISION NULL,
-  extras JSONB NULL,
-  regdata TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (fonte, data, lugar)
-);
-```
-
-### SQL (MySQL/MariaDB)
-
-```sql
-CREATE TABLE meteo (
-  fonte VARCHAR(32) NOT NULL,
-  data  DATETIME NOT NULL,
-  temp DOUBLE NULL,
-  humidade DOUBLE NULL,
-  vento DOUBLE NULL,
-  pressao DOUBLE NULL,
-  precipitacao DOUBLE NULL,
-  lugar VARCHAR(128) NOT NULL,
-  lat DOUBLE NULL,
-  lon DOUBLE NULL,
-  extras JSON NULL,
-  regdata TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE KEY uq_meteo (fonte, data, lugar)
-);
-```
-
-### MongoDB
-
-Sem schema fixo. Recomenda-se um índice:
-
-```js
-db.meteo.createIndex({ fonte: 1, data: 1, lugar: 1 }, { unique: true })
-```
-
----
-
-## Mapeamento de dados
-
-O parser converte a resposta da API num registo canónico:
-
-| Campo core | Weatherbit | IPMA | ICAO/METAR |
-|---|---|---|---|
-| `temp` | `temp` | `temperatura` | `tempC` (ou parse do METAR) |
-| `humidade` | `rh` | `humidade` | calculada (temp/dewpoint) se possível |
-| `vento` | `wind_spd` | `intensidadeVento` | knots → m/s |
-| `pressao` | `pres` | `pressao` | `Q####` / `A####` |
-| `precipitacao` | `precip` | `precAcumulada` | (normalmente n/a) |
-| `lugar` | `city_name` | `station_id` | `ICAO_CODE` |
-
----
-
-## Extensibilidade
-
-### Adicionar uma nova BD (target)
-
-1. **Adicionar um target** ao `db_targets.json`:
-   - definir `type`, `dsn_env/uri_env`, `table`/`collection`
-2. **Criar a variável no `.env`** com o DSN/URI (ou mete no CI/Secrets).
-3. Garantir que a lib está instalada:
-   - Postgres/CrateDB → `psycopg2-binary`
-   - MySQL → `pymysql` ou `mysql-connector-python`
-   - MongoDB → `pymongo`
-
-> Não é preciso alterar a lógica de dedup/insert: cada target segue o mesmo contrato (`type`, `conn/col`, `table`, etc.).
-
----
-
-### Adicionar uma nova API (provider)
-
-O “contrato” do provider é: produzir uma lista `rows` onde cada item é um `dict` com os **campos core** (e `extras` opcional).
-
-Passos:
-
-1. **Config**
-   - adicionar o nome à whitelist: `PIPELINE_API_PROVIDER in ("weatherbit","ipma","icao","<novo>")`
-   - adicionar as variáveis necessárias no `.env` (ex.: `NEWPROVIDER_KEY`, `NEWPROVIDER_URL`)
-2. **Request**
-   - definir o URL do novo provider (ou usa `PIPELINE_API_URL` como override)
-3. **Parse**
-   - criar um bloco `elif API_PROVIDER == "<novo>": ...`
-   - converter resposta em `rows.append({ ... })`
-
-Checklist rápido:
-- `data` deve ser `datetime` (idealmente UTC)
-- `lugar` deve existir e ser estável
-- se houver campos que só existem nesta API → meter em `r["extras"]`
-
----
-
-### Adicionar colunas novas
-
-#### Novo campo extra (opcional)
-
-Ex.: quer `feels_like`, mas só o Weatherbit fornece.
-
-1. No parser, adiciona-se:
-   ```python
-   "extras": {"feels_like": obs.get("app_temp")}
-   ```
-2. Para SQL, garante-se que:
-   - a tabela tem uma coluna (`extras` ou outra)
-   - o target tem `extras_column` definido (ou `PIPELINE_SQL_EXTRAS_COLUMN` global)
-3. Para MongoDB, não é preciso schema: `extras` fica no documento.
-
-**Vantagem:** não se mexe no core nem em todas as DBs — só os targets que suportam extras guardam.
-
----
-
-#### Novo campo core (obrigatório)
-
-Ex.: quer adicionar `uv_index` como campo “obrigatório”.
-
-Checklist (tem de atualizar tudo o que “assume” o core):
-
-1. **Parser**: o novo campo tem de existir em **todas** as APIs (ou ter fallback/valor `None`).
-2. **COLUMNS**: adicionar o nome na lista de colunas core usada no insert.
-3. **Schema SQL**: adicionar coluna na tabela (em todas as DBs SQL usadas).
-4. **MongoDB**: sem schema obrigatório, mas convém manter consistência.
-
-> Regra prática: se só algumas fontes têm o campo → **extras**.  
-> Se quer mesmo tornar “core” → tem de ser garantida a compatibilidade em todas as fontes/targets.
-
----
-
-## Troubleshooting
-
-- **SecretNotFoundError no Colab**: pode acontecer se fizer `userdata.get("X")` para um secret que não existe.  
-  Solução: envolver com `try/except` ou só chamar `userdata.get()` se tiver a certeza que está definido.
-- **“Resposta <provider> inesperada”**: o provider está certo mas o formato mudou → rever o bloco de parse desse provider.
-- **Problemas de timestamp/dedup**: confirmar que `data` está a ser normalizado para UTC e sem microseconds.
-
----
-
+The meteorological use case acts as the current implementation, while the pipeline architecture allows other structured data sources to be integrated using the same approach.
